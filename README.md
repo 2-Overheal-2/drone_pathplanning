@@ -33,6 +33,9 @@ docker exec -it uav-path-planning bash
 
 ### 4. Обучение модели
 \`\`\`bash
+python train_ppo.py
+\`\`\`
+
 # Обучение
 python train_ppo.py
 
