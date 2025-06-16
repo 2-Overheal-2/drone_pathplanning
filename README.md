@@ -17,56 +17,40 @@
 ## Запуск с Docker
 
 ### 1. Сборка контейнера
-\`\`\`bash
-docker compose build
-\`\`\`
+
+`docker compose build`
 
 ### 2. Запуск контейнера
-\`\`\`bash
-docker compose up -d uav-training
-\`\`\`
+
+`docker compose up -d uav-training`
 
 ### 3. Подключение к контейнеру
-\`\`\`bash
-docker exec -it uav-path-planning bash
-\`\`\`
+
+`docker exec -it uav-path-planning bash`
 
 ### 4. Обучение модели
-\`\`\`bash
-python train_ppo.py
-\`\`\`
 
-# Обучение
-python train_ppo.py
+`python train_ppo.py`
 
 ### 5. Мониторинг обучения (TensorBoard)
-\`\`\`bash
+
 # В отдельном терминале
-docker-compose up -d tensorboard
-\`\`\`
+
+`docker-compose up -d tensorboard`
+
 Откройте браузер: http://localhost:6006
 
 ### 6. Оценка обученной модели
-\`\`\`bash
+
+`
 python evaluate_ppo.py --model checkpoints/racing_ppo_uav_final.zip
-\`\`\`
+`
 
 ## Локальная установка
 
-### 1. Установка зависимостей
-\`\`\`bash
+`
 pip install -r requirements.txt
-\`\`\`
-
-### 2. Обучение
-\`\`\`bash
-python train_ppo.py
-\`\`\`
-
-### 3. Оценка
-\`\`\`bash
-python evaluate_ppo.py --model checkpoints/racing_ppo_uav_final.zip
-\`\`\`
+`
 
 ## 📁 Структура проекта
 
