@@ -49,5 +49,5 @@ ENV MESA_GL_VERSION_OVERRIDE=3.3
 # Expose port for TensorBoard
 EXPOSE 6006
 
-# Default command
-CMD ["python", "train_sb3_racing.py", "--config", "configs/sb3_racing_config.yaml", "--headless"]
+# Keep container running
+CMD ["tail", "-f", "/dev/null"]
