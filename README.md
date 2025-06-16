@@ -34,7 +34,7 @@
 
 ### 5. Мониторинг обучения (TensorBoard)
 
-# В отдельном терминале
+В отдельном терминале
 
 `docker-compose up -d tensorboard`
 
