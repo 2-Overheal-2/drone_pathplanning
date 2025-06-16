@@ -54,7 +54,7 @@ pip install -r requirements.txt
 
 ## 📁 Структура проекта
 
-\`\`\`
+```
 uav-path-planning/
 ├── train_ppo.py          # Основной скрипт обучения
 ├── evaluate_ppo.py       # Скрипт оценки модели
@@ -65,7 +65,7 @@ uav-path-planning/
 ├── Dockerfile                   # Docker конфигурация
 ├── docker-compose.yaml          # Docker Compose конфигурация
 └── requirements.txt             # Python зависимости
-\`\`\`
+```
 
 
 ## 📊 Мониторинг и анализ
