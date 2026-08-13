@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   uav-training:
     build: .
@@ -13,7 +11,7 @@ services:
       - MESA_GL_VERSION_OVERRIDE=3.3
     stdin_open: true
     tty: true
-    
+
   tensorboard:
     build: .
     container_name: uav-tensorboard
