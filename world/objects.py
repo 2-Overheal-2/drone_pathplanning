@@ -1,271 +1,950 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
-import math
+from typing import Sequence
 
 import numpy as np
 import pybullet as p
 
-
-Vector3 = Sequence[float]
-Quaternion = Sequence[float]
+from world.models.base import ObjectModel, PrimitiveModel
 
 
-def _rgba(value: Sequence[float]) -> List[float]:
-    rgba = list(value)
-    if len(rgba) != 4:
-        raise ValueError("Цвет должен быть RGBA из 4 компонентов.")
-    return [float(x) for x in rgba]
+def _as_vector3(
+    value: Sequence[float],
+) -> np.ndarray:
+    array = np.asarray(
+        value,
+        dtype=float,
+    )
+
+    if array.shape != (3,):
+        raise ValueError(
+            "Ожидался вектор из трёх значений."
+        )
+
+    return array
+
+
+def _as_quaternion(
+    value: Sequence[float],
+) -> np.ndarray:
+    array = np.asarray(
+        value,
+        dtype=float,
+    )
+
+    if array.shape != (4,):
+        raise ValueError(
+            "Quaternion должен содержать 4 значения."
+        )
+
+    return array
+
+
+def _oriented_aabb(
+    position: np.ndarray,
+    dimensions: np.ndarray,
+    orientation: np.ndarray,
+):
+    """
+    Консервативный AABB объекта
+    с учётом ориентации.
+    """
+
+    half = (
+        dimensions
+        / 2.0
+    )
+
+    rotation = np.asarray(
+        p.getMatrixFromQuaternion(
+            orientation.tolist()
+        ),
+        dtype=float,
+    ).reshape(
+        3,
+        3,
+    )
+
+    world_half = (
+        np.abs(rotation)
+        @ half
+    )
+
+    return (
+        position - world_half,
+        position + world_half,
+    )
 
 
 @dataclass
 class Obstacle:
-    """Нейтральное описание статического препятствия + его PyBullet body."""
+    """
+    Статический объект среды.
+
+    Старый режим:
+
+        geometry="box"
+        dimensions=[...]
+
+    Новый режим:
+
+        model=BuildingModel(...)
+        model=TreeModel(...)
+        model=WireModel(...)
+
+    Если model задан, именно модель создаёт
+    визуальную и collision геометрию.
+    """
 
     kind: str
+
     geometry: str
+
     position: np.ndarray
+
     dimensions: np.ndarray
-    color: Sequence[float] = (0.6, 0.6, 0.6, 1.0)
-    body_id: Optional[int] = None
 
-    @property
-    def footprint_area(self) -> float:
-        if self.geometry == "cylinder":
-            radius = float(self.dimensions[0]) / 2.0
-            return math.pi * radius * radius
-        return float(self.dimensions[0] * self.dimensions[1])
+    color: Sequence[float] = (
+        0.6,
+        0.6,
+        0.6,
+        1.0,
+    )
 
-    @property
-    def aabb(self) -> Tuple[List[float], List[float]]:
-        # Для planner'а и быстрых проверок цилиндр тоже представляем AABB.
-        half = self.dimensions / 2.0
-        return (self.position - half).tolist(), (self.position + half).tolist()
-
-    def spawn(self, client_id: int) -> int:
-        collision, visual = self._create_shapes(client_id)
-
-        self.body_id = p.createMultiBody(
-            baseMass=0.0,
-            baseCollisionShapeIndex=collision,
-            baseVisualShapeIndex=visual,
-            basePosition=self.position.tolist(),
-            physicsClientId=client_id,
+    orientation: np.ndarray = field(
+        default_factory=lambda: np.asarray(
+            [
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            dtype=float,
         )
+    )
+
+    model: ObjectModel | None = None
+
+    body_id: int | None = None
+
+    def __post_init__(
+        self,
+    ) -> None:
+        self.position = (
+            _as_vector3(
+                self.position
+            )
+        )
+
+        self.orientation = (
+            _as_quaternion(
+                self.orientation
+            )
+        )
+
+        self.dimensions = (
+            _as_vector3(
+                self.dimensions
+            )
+        )
+
+        self.color = tuple(
+            float(value)
+            for value
+            in self.color
+        )
+
+        if self.model is not None:
+            self.dimensions = (
+                self.model
+                .bounding_dimensions
+                .astype(float)
+            )
+
+        if np.any(
+            self.dimensions <= 0.0
+        ):
+            raise ValueError(
+                "Размеры препятствия должны быть > 0."
+            )
+
+    @property
+    def footprint_area(
+        self,
+    ) -> float:
+        """
+        Приблизительная площадь объекта на XY.
+
+        Используется генераторами сценариев
+        для контроля density.
+        """
+
+        width = float(
+            self.dimensions[0]
+        )
+
+        depth = float(
+            self.dimensions[1]
+        )
+
+        if self.geometry == "cylinder":
+            radius_x = (
+                width
+                / 2.0
+            )
+
+            radius_y = (
+                depth
+                / 2.0
+            )
+
+            return float(
+                np.pi
+                * radius_x
+                * radius_y
+            )
+
+        return float(
+            width
+            * depth
+        )
+
+    @property
+    def aabb(
+        self,
+    ):
+        """
+        Получить AABB без передачи body_id наружу.
+        """
+
+        if self.model is not None:
+            return self.model.world_aabb(
+                position=self.position,
+                orientation=self.orientation,
+            )
+
+        return _oriented_aabb(
+            position=self.position,
+            dimensions=self.dimensions,
+            orientation=self.orientation,
+        )
+
+    def spawn(
+        self,
+        client_id: int,
+    ) -> int:
+        """
+        Создать статический объект в PyBullet.
+        """
+
+        if self.body_id is not None:
+            return self.body_id
+
+        if self.model is not None:
+            self.body_id = (
+                self.model.spawn(
+                    client_id=client_id,
+                    position=self.position,
+                    orientation=self.orientation,
+                    mass=0.0,
+                )
+            )
+
+            return self.body_id
+
+        primitive = PrimitiveModel(
+            kind=self.kind,
+            geometry=self.geometry,
+            dimensions=self.dimensions,
+            color=self.color,
+        )
+
+        self.body_id = (
+            primitive.spawn(
+                client_id=client_id,
+                position=self.position,
+                orientation=self.orientation,
+                mass=0.0,
+            )
+        )
+
         return self.body_id
 
-    def clear_body_id(self) -> None:
-        self.body_id = None
+    def export(
+        self,
+    ) -> dict:
+        """
+        Нейтральное описание объекта.
 
-    def _create_shapes(self, client_id: int) -> Tuple[int, int]:
-        if self.geometry == "box":
-            half = (self.dimensions / 2.0).tolist()
-            collision = p.createCollisionShape(
-                p.GEOM_BOX,
-                halfExtents=half,
-                physicsClientId=client_id,
-            )
-            visual = p.createVisualShape(
-                p.GEOM_BOX,
-                halfExtents=half,
-                rgbaColor=_rgba(self.color),
-                physicsClientId=client_id,
-            )
-            return collision, visual
+        body_id сюда специально не попадает.
+        """
 
-        if self.geometry == "cylinder":
-            diameter, _, height = self.dimensions.tolist()
-            radius = diameter / 2.0
-            collision = p.createCollisionShape(
-                p.GEOM_CYLINDER,
-                radius=radius,
-                height=height,
-                physicsClientId=client_id,
-            )
-            visual = p.createVisualShape(
-                p.GEOM_CYLINDER,
-                radius=radius,
-                length=height,
-                rgbaColor=_rgba(self.color),
-                physicsClientId=client_id,
-            )
-            return collision, visual
+        aabb_min, aabb_max = (
+            self.aabb
+        )
 
-        raise ValueError(f"Неподдерживаемая геометрия препятствия: {self.geometry}")
-
-    def export(self) -> dict:
-        aabb_min, aabb_max = self.aabb
         return {
             "type": self.geometry,
             "kind": self.kind,
-            "position": self.position.tolist(),
-            "dimensions": self.dimensions.tolist(),
-            "aabb_min": aabb_min,
-            "aabb_max": aabb_max,
+
+            "model": (
+                self.model.__class__.__name__
+                if self.model is not None
+                else None
+            ),
+
+            "position": (
+                self.position.tolist()
+            ),
+
+            "dimensions": (
+                self.dimensions.tolist()
+            ),
+
+            "orientation": (
+                self.orientation.tolist()
+            ),
+
+            "aabb_min": (
+                aabb_min.tolist()
+            ),
+
+            "aabb_max": (
+                aabb_max.tolist()
+            ),
+
             "dynamic": False,
-            "body_id": self.body_id,
         }
 
 
-class Trajectory:
-    """Интерфейс кинематической траектории."""
+class Trajectory(ABC):
+    """
+    Базовый интерфейс траектории.
+    """
 
-    def sample(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
+    @abstractmethod
+    def sample(
+        self,
+        simulation_time: float,
+    ):
+        """
+        Вернуть:
+
+            position,
+            orientation
+        """
+
         raise NotImplementedError
 
 
-class LinearTrajectory(Trajectory):
-    """Движение start -> end -> start с заданной скоростью."""
+class LinearTrajectory(
+    Trajectory
+):
+    """
+    Линейное движение между двумя точками.
 
-    def __init__(self, start: Vector3, end: Vector3, speed: float = 1.0, loop: bool = True):
-        self.start = np.asarray(start, dtype=float)
-        self.end = np.asarray(end, dtype=float)
-        self.speed = max(0.0, float(speed))
-        self.loop = bool(loop)
+    При loop=True:
 
-        delta = self.end - self.start
-        self.length = float(np.linalg.norm(delta))
-        self.direction = delta / self.length if self.length > 1e-9 else np.zeros(3, dtype=float)
+        start -> end -> start -> end ...
+    """
 
-    def sample(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        if self.length <= 1e-9:
-            position = self.start.copy()
+    def __init__(
+        self,
+        start: Sequence[float],
+        end: Sequence[float],
+        speed: float,
+        loop: bool = True,
+    ):
+        self.start = (
+            _as_vector3(
+                start
+            )
+        )
+
+        self.end = (
+            _as_vector3(
+                end
+            )
+        )
+
+        self.speed = float(
+            speed
+        )
+
+        self.loop = bool(
+            loop
+        )
+
+        if self.speed < 0.0:
+            raise ValueError(
+                "speed не может быть отрицательной."
+            )
+
+        self.direction = (
+            self.end
+            - self.start
+        )
+
+        self.distance = float(
+            np.linalg.norm(
+                self.direction
+            )
+        )
+
+        if self.distance > 1e-9:
+            self.unit_direction = (
+                self.direction
+                / self.distance
+            )
+
         else:
-            distance = self.speed * max(0.0, float(t))
+            self.unit_direction = (
+                np.zeros(
+                    3,
+                    dtype=float,
+                )
+            )
 
-            if self.loop:
-                phase = (distance / self.length) % 2.0
-                if phase <= 1.0:
-                    position = self.start + self.direction * (phase * self.length)
-                    direction = self.direction
-                else:
-                    position = self.end - self.direction * ((phase - 1.0) * self.length)
-                    direction = -self.direction
+    def sample(
+        self,
+        simulation_time: float,
+    ):
+        time_value = max(
+            0.0,
+            float(
+                simulation_time
+            ),
+        )
+
+        if (
+            self.distance <= 1e-9
+            or self.speed <= 1e-9
+        ):
+            return (
+                self.start.copy(),
+
+                np.asarray(
+                    [
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ],
+                    dtype=float,
+                ),
+            )
+
+        travelled = (
+            time_value
+            * self.speed
+        )
+
+        if self.loop:
+            cycle_length = (
+                2.0
+                * self.distance
+            )
+
+            cycle_position = (
+                travelled
+                % cycle_length
+            )
+
+            if (
+                cycle_position
+                <= self.distance
+            ):
+                distance_along = (
+                    cycle_position
+                )
+
+                movement_direction = (
+                    self.unit_direction
+                )
+
             else:
-                distance = min(distance, self.length)
-                position = self.start + self.direction * distance
-                direction = self.direction
+                distance_along = (
+                    cycle_length
+                    - cycle_position
+                )
 
-            yaw = math.atan2(direction[1], direction[0]) if np.linalg.norm(direction[:2]) > 1e-9 else 0.0
-            return position, np.asarray(p.getQuaternionFromEuler([0.0, 0.0, yaw]), dtype=float)
+                movement_direction = (
+                    -self.unit_direction
+                )
 
-        return position, np.asarray([0.0, 0.0, 0.0, 1.0], dtype=float)
+        else:
+            distance_along = min(
+                travelled,
+                self.distance,
+            )
+
+            movement_direction = (
+                self.unit_direction
+            )
+
+        position = (
+            self.start
+            + self.unit_direction
+            * distance_along
+        )
+
+        yaw = float(
+            np.arctan2(
+                movement_direction[1],
+                movement_direction[0],
+            )
+        )
+
+        orientation = np.asarray(
+            p.getQuaternionFromEuler(
+                [
+                    0.0,
+                    0.0,
+                    yaw,
+                ]
+            ),
+            dtype=float,
+        )
+
+        return (
+            position,
+            orientation,
+        )
 
 
-class WaypointTrajectory(Trajectory):
-    """Равномерное движение по последовательности 3D waypoint'ов."""
+class WaypointTrajectory(
+    Trajectory
+):
+    """
+    Движение через последовательность
+    трёхмерных точек.
+    """
 
-    def __init__(self, waypoints: Sequence[Vector3], speed: float = 1.0, loop: bool = True):
-        self.waypoints = [np.asarray(point, dtype=float) for point in waypoints]
-        self.speed = max(0.0, float(speed))
-        self.loop = bool(loop)
+    def __init__(
+        self,
+        waypoints: Sequence[
+            Sequence[float]
+        ],
+        speed: float,
+        loop: bool = True,
+    ):
+        if len(
+            waypoints
+        ) < 2:
+            raise ValueError(
+                "WaypointTrajectory требует минимум две точки."
+            )
 
-        if len(self.waypoints) < 2:
-            raise ValueError("WaypointTrajectory требует минимум 2 точки.")
-
-        points = self.waypoints + ([self.waypoints[0]] if self.loop else [])
-        self.segment_lengths = [
-            float(np.linalg.norm(b - a))
-            for a, b in zip(points[:-1], points[1:])
+        self.waypoints = [
+            _as_vector3(
+                point
+            )
+            for point
+            in waypoints
         ]
-        self.total_length = float(sum(self.segment_lengths))
 
-    def sample(self, t: float) -> Tuple[np.ndarray, np.ndarray]:
-        if self.total_length <= 1e-9:
-            return self.waypoints[0].copy(), np.asarray([0.0, 0.0, 0.0, 1.0], dtype=float)
+        self.speed = float(
+            speed
+        )
 
-        distance = self.speed * max(0.0, float(t))
-        distance = distance % self.total_length if self.loop else min(distance, self.total_length)
+        self.loop = bool(
+            loop
+        )
 
-        points = self.waypoints + ([self.waypoints[0]] if self.loop else [])
+        if self.speed < 0.0:
+            raise ValueError(
+                "speed не может быть отрицательной."
+            )
 
-        for index, segment_length in enumerate(self.segment_lengths):
-            if distance <= segment_length or index == len(self.segment_lengths) - 1:
-                a, b = points[index], points[index + 1]
-                alpha = 0.0 if segment_length <= 1e-9 else distance / segment_length
-                position = a + (b - a) * alpha
-                direction = b - a
-                yaw = math.atan2(direction[1], direction[0]) if np.linalg.norm(direction[:2]) > 1e-9 else 0.0
-                orientation = np.asarray(p.getQuaternionFromEuler([0.0, 0.0, yaw]), dtype=float)
-                return position, orientation
+        self._segments = []
 
-            distance -= segment_length
+        for index in range(
+            len(self.waypoints) - 1
+        ):
+            start = (
+                self.waypoints[index]
+            )
 
-        return self.waypoints[-1].copy(), np.asarray([0.0, 0.0, 0.0, 1.0], dtype=float)
+            end = (
+                self.waypoints[
+                    index + 1
+                ]
+            )
+
+            vector = (
+                end - start
+            )
+
+            length = float(
+                np.linalg.norm(
+                    vector
+                )
+            )
+
+            if length <= 1e-9:
+                continue
+
+            self._segments.append(
+                (
+                    start,
+                    end,
+                    vector / length,
+                    length,
+                )
+            )
+
+        if not self._segments:
+            raise ValueError(
+                "Все waypoints совпадают."
+            )
+
+        self.total_length = float(
+            sum(
+                segment[3]
+                for segment
+                in self._segments
+            )
+        )
+
+    def sample(
+        self,
+        simulation_time: float,
+    ):
+        time_value = max(
+            0.0,
+            float(
+                simulation_time
+            ),
+        )
+
+        if self.speed <= 1e-9:
+            position = (
+                self._segments[0][0]
+                .copy()
+            )
+
+            orientation = (
+                self._orientation_from_direction(
+                    self._segments[0][2]
+                )
+            )
+
+            return (
+                position,
+                orientation,
+            )
+
+        travelled = (
+            time_value
+            * self.speed
+        )
+
+        if self.loop:
+            travelled = (
+                travelled
+                % self.total_length
+            )
+
+        else:
+            travelled = min(
+                travelled,
+                self.total_length,
+            )
+
+        remaining = (
+            travelled
+        )
+
+        for (
+            start,
+            end,
+            direction,
+            length,
+        ) in self._segments:
+            if remaining <= length:
+                position = (
+                    start
+                    + direction
+                    * remaining
+                )
+
+                orientation = (
+                    self._orientation_from_direction(
+                        direction
+                    )
+                )
+
+                return (
+                    position,
+                    orientation,
+                )
+
+            remaining -= (
+                length
+            )
+
+        (
+            start,
+            end,
+            direction,
+            length,
+        ) = self._segments[-1]
+
+        return (
+            end.copy(),
+
+            self._orientation_from_direction(
+                direction
+            ),
+        )
+
+    @staticmethod
+    def _orientation_from_direction(
+        direction: np.ndarray,
+    ) -> np.ndarray:
+        yaw = float(
+            np.arctan2(
+                direction[1],
+                direction[0],
+            )
+        )
+
+        return np.asarray(
+            p.getQuaternionFromEuler(
+                [
+                    0.0,
+                    0.0,
+                    yaw,
+                ]
+            ),
+            dtype=float,
+        )
 
 
 @dataclass
 class DynamicObject:
-    """Кинематический объект: машина, пешеход и т.п."""
+    """
+    Кинематический динамический объект.
+
+    Примеры:
+
+        car
+        pedestrian
+
+    Объект перемещается по Trajectory через
+    resetBasePositionAndOrientation().
+
+    mass=0 используется намеренно.
+    """
 
     kind: str
-    geometry: str
-    dimensions: np.ndarray
-    trajectory: Trajectory
-    color: Sequence[float] = (0.2, 0.2, 0.8, 1.0)
 
-    body_id: Optional[int] = None
-    position: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=float))
-    orientation: np.ndarray = field(
-        default_factory=lambda: np.asarray([0.0, 0.0, 0.0, 1.0], dtype=float)
+    geometry: str
+
+    dimensions: np.ndarray
+
+    trajectory: Trajectory
+
+    color: Sequence[float] = (
+        0.8,
+        0.3,
+        0.2,
+        1.0,
     )
 
-    @property
-    def aabb(self) -> Tuple[List[float], List[float]]:
-        half = self.dimensions / 2.0
-        return (self.position - half).tolist(), (self.position + half).tolist()
+    #
+    # Вот этого поля не было
+    # в твоей текущей версии.
+    #
+    model: ObjectModel | None = None
 
-    def spawn(self, client_id: int, t0: float = 0.0) -> int:
-        self.position, self.orientation = self.trajectory.sample(t0)
+    body_id: int | None = None
 
-        if self.geometry == "box":
-            half = (self.dimensions / 2.0).tolist()
-            collision = p.createCollisionShape(
-                p.GEOM_BOX,
-                halfExtents=half,
-                physicsClientId=client_id,
-            )
-            visual = p.createVisualShape(
-                p.GEOM_BOX,
-                halfExtents=half,
-                rgbaColor=_rgba(self.color),
-                physicsClientId=client_id,
-            )
-        elif self.geometry == "cylinder":
-            diameter, _, height = self.dimensions.tolist()
-            radius = diameter / 2.0
-            collision = p.createCollisionShape(
-                p.GEOM_CYLINDER,
-                radius=radius,
-                height=height,
-                physicsClientId=client_id,
-            )
-            visual = p.createVisualShape(
-                p.GEOM_CYLINDER,
-                radius=radius,
-                length=height,
-                rgbaColor=_rgba(self.color),
-                physicsClientId=client_id,
-            )
-        else:
-            raise ValueError(f"Неподдерживаемая геометрия dynamic object: {self.geometry}")
-
-        self.body_id = p.createMultiBody(
-            baseMass=0.0,
-            baseCollisionShapeIndex=collision,
-            baseVisualShapeIndex=visual,
-            basePosition=self.position.tolist(),
-            baseOrientation=self.orientation.tolist(),
-            physicsClientId=client_id,
+    position: np.ndarray = field(
+        default_factory=lambda: np.zeros(
+            3,
+            dtype=float,
         )
+    )
+
+    orientation: np.ndarray = field(
+        default_factory=lambda: np.asarray(
+            [
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ],
+            dtype=float,
+        )
+    )
+
+    def __post_init__(
+        self,
+    ) -> None:
+        self.dimensions = (
+            _as_vector3(
+                self.dimensions
+            )
+        )
+
+        self.color = tuple(
+            float(value)
+            for value
+            in self.color
+        )
+
+        if self.model is not None:
+            self.dimensions = (
+                self.model
+                .bounding_dimensions
+                .astype(float)
+            )
+
+        (
+            initial_position,
+            initial_orientation,
+        ) = self.trajectory.sample(
+            0.0
+        )
+
+        self.position = (
+            _as_vector3(
+                initial_position
+            )
+        )
+
+        self.orientation = (
+            _as_quaternion(
+                initial_orientation
+            )
+        )
+
+        if np.any(
+            self.dimensions <= 0.0
+        ):
+            raise ValueError(
+                "Размеры DynamicObject должны быть > 0."
+            )
+
+    @property
+    def aabb(
+        self,
+    ):
+        """
+        Текущий AABB динамического объекта.
+        """
+
+        if self.model is not None:
+            return self.model.world_aabb(
+                position=self.position,
+                orientation=self.orientation,
+            )
+
+        return _oriented_aabb(
+            position=self.position,
+            dimensions=self.dimensions,
+            orientation=self.orientation,
+        )
+
+    def spawn(
+        self,
+        client_id: int,
+    ) -> int:
+        """
+        Создать динамический объект.
+
+        Для CarModel:
+            visual = OBJ
+            collision = box
+
+        Для старых объектов:
+            используется PrimitiveModel.
+        """
+
+        (
+            position,
+            orientation,
+        ) = self.trajectory.sample(
+            0.0
+        )
+
+        self.position = (
+            _as_vector3(
+                position
+            )
+        )
+
+        self.orientation = (
+            _as_quaternion(
+                orientation
+            )
+        )
+
+        if self.model is not None:
+            self.body_id = (
+                self.model.spawn(
+                    client_id=client_id,
+                    position=self.position,
+                    orientation=self.orientation,
+                    mass=0.0,
+                )
+            )
+
+            return self.body_id
+
+        primitive = PrimitiveModel(
+            kind=self.kind,
+            geometry=self.geometry,
+            dimensions=self.dimensions,
+            color=self.color,
+        )
+
+        self.body_id = (
+            primitive.spawn(
+                client_id=client_id,
+                position=self.position,
+                orientation=self.orientation,
+                mass=0.0,
+            )
+        )
+
         return self.body_id
 
-    def update(self, t: float, client_id: int) -> None:
+    def update(
+        self,
+        simulation_time: float,
+        client_id: int,
+    ) -> None:
+        """
+        Переместить объект в положение,
+        заданное траекторией.
+        """
+
+        (
+            position,
+            orientation,
+        ) = self.trajectory.sample(
+            simulation_time
+        )
+
+        self.position = (
+            _as_vector3(
+                position
+            )
+        )
+
+        self.orientation = (
+            _as_quaternion(
+                orientation
+            )
+        )
+
         if self.body_id is None:
             return
 
-        self.position, self.orientation = self.trajectory.sample(t)
         p.resetBasePositionAndOrientation(
             self.body_id,
             self.position.tolist(),
@@ -273,18 +952,48 @@ class DynamicObject:
             physicsClientId=client_id,
         )
 
-    def clear_body_id(self) -> None:
-        self.body_id = None
+    def export(
+        self,
+    ) -> dict:
+        """
+        Нейтральное описание объекта.
 
-    def export(self) -> dict:
-        aabb_min, aabb_max = self.aabb
+        body_id наружу не передаётся.
+        """
+
+        aabb_min, aabb_max = (
+            self.aabb
+        )
+
         return {
             "type": self.geometry,
             "kind": self.kind,
-            "position": self.position.tolist(),
-            "dimensions": self.dimensions.tolist(),
-            "aabb_min": aabb_min,
-            "aabb_max": aabb_max,
+
+            "model": (
+                self.model.__class__.__name__
+                if self.model is not None
+                else None
+            ),
+
+            "position": (
+                self.position.tolist()
+            ),
+
+            "dimensions": (
+                self.dimensions.tolist()
+            ),
+
+            "orientation": (
+                self.orientation.tolist()
+            ),
+
+            "aabb_min": (
+                aabb_min.tolist()
+            ),
+
+            "aabb_max": (
+                aabb_max.tolist()
+            ),
+
             "dynamic": True,
-            "body_id": self.body_id,
         }

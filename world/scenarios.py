@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -8,167 +8,921 @@ from world.config import ArenaConfig
 from world.objects import Obstacle
 
 
-def _overlaps_xy(candidate: Obstacle, obstacles: List[Obstacle], clearance: float) -> bool:
-    cmin, cmax = candidate.aabb
+Block = Tuple[
+    float,
+    float,
+    float,
+    float,
+]
+
+
+def _obstacles_overlap_xy(
+    candidate: Obstacle,
+    obstacles: Sequence[Obstacle],
+    clearance: float,
+) -> bool:
+    """
+    Проверка пересечения объектов по XY
+    с дополнительным clearance.
+    """
+
+    candidate_min, candidate_max = (
+        candidate.aabb
+    )
 
     for obstacle in obstacles:
-        omin, omax = obstacle.aabb
-        separated = (
-            cmax[0] + clearance < omin[0]
-            or cmin[0] - clearance > omax[0]
-            or cmax[1] + clearance < omin[1]
-            or cmin[1] - clearance > omax[1]
+
+        obstacle_min, obstacle_max = (
+            obstacle.aabb
         )
+
+        separated = (
+            candidate_max[0] + clearance
+            < obstacle_min[0]
+
+            or candidate_min[0] - clearance
+            > obstacle_max[0]
+
+            or candidate_max[1] + clearance
+            < obstacle_min[1]
+
+            or candidate_min[1] - clearance
+            > obstacle_max[1]
+        )
+
         if not separated:
             return True
 
     return False
 
 
-def _contains_point_xy(candidate: Obstacle, point, clearance: float) -> bool:
-    x, y, _ = point
-    minimum, maximum = candidate.aabb
+def _point_inside_obstacle_xy(
+    obstacle: Obstacle,
+    point,
+    clearance: float,
+) -> bool:
+    """
+    Проверить, находится ли start/goal
+    внутри объекта или слишком близко к нему.
+    """
+
+    obstacle_min, obstacle_max = (
+        obstacle.aabb
+    )
+
+    x = float(
+        point[0]
+    )
+
+    y = float(
+        point[1]
+    )
+
     return (
-        minimum[0] - clearance <= x <= maximum[0] + clearance
-        and minimum[1] - clearance <= y <= maximum[1] + clearance
+        obstacle_min[0] - clearance
+        <= x
+        <= obstacle_max[0] + clearance
+
+        and obstacle_min[1] - clearance
+        <= y
+        <= obstacle_max[1] + clearance
     )
 
 
-def _uniform_size(rng: np.random.Generator, arena_axis: float, low_fraction: float, high_fraction: float, hard_min: float, hard_max: float) -> float:
-    low = min(hard_min, max(0.15, arena_axis * low_fraction))
-    high = min(hard_max, max(low, arena_axis * high_fraction))
-    return float(rng.uniform(low, high)) if high > low else float(low)
+def _near_start_or_goal(
+    obstacle: Obstacle,
+    config: ArenaConfig,
+) -> bool:
+
+    return (
+        _point_inside_obstacle_xy(
+            obstacle,
+            config.start,
+            config.start_goal_clearance,
+        )
+        or
+        _point_inside_obstacle_xy(
+            obstacle,
+            config.goal,
+            config.start_goal_clearance,
+        )
+    )
 
 
-class ScenarioGenerator:
-    def generate(self, config: ArenaConfig, rng: np.random.Generator) -> List[Obstacle]:
-        raise NotImplementedError
+def _clamp_height_range(
+    value_range,
+    arena_height: float,
+):
+    """
+    Не позволяем объектам быть выше арены.
+    """
+
+    minimum = min(
+        float(value_range[0]),
+        arena_height,
+    )
+
+    maximum = min(
+        float(value_range[1]),
+        arena_height,
+    )
+
+    if maximum < minimum:
+        minimum = maximum
+
+    return (
+        minimum,
+        maximum,
+    )
 
 
-class EmptyScenario(ScenarioGenerator):
-    def generate(self, config: ArenaConfig, rng: np.random.Generator) -> List[Obstacle]:
+class EmptyScenario:
+    """
+    Пустая арена.
+    """
+
+    def generate(
+        self,
+        config: ArenaConfig,
+        rng: np.random.Generator,
+    ) -> List[Obstacle]:
+
         return []
 
 
-class CityScenario(ScenarioGenerator):
-    """Упрощённый городской сценарий: здания + иногда колонны."""
+class CityScenario:
+    """
+    Городской сценарий.
 
-    def generate(self, config: ArenaConfig, rng: np.random.Generator) -> List[Obstacle]:
-        sx, sy, sz = config.size
-        target_area = sx * sy * config.density
+    Арена разбивается на кварталы.
+
+    Между кварталами остаются пустые
+    полосы шириной road_width.
+
+    Внутри кварталов генерируются:
+    - buildings
+    - columns
+    """
+
+    def generate(
+        self,
+        config: ArenaConfig,
+        rng: np.random.Generator,
+    ) -> List[Obstacle]:
+
+        size_x, size_y, size_z = (
+            config.size
+        )
+
+        blocks = self._generate_blocks(
+            config
+        )
+
+        if not blocks:
+            return []
+
+        target_area = (
+            size_x
+            * size_y
+            * config.density
+        )
+
+        obstacles: List[
+            Obstacle
+        ] = []
+
         occupied_area = 0.0
-        result: List[Obstacle] = []
 
         attempts = 0
-        max_attempts = max(2000, config.max_objects * 80)
+
+        max_attempts = max(
+            1000,
+            config.max_objects * 80,
+        )
 
         while (
-            occupied_area < target_area
-            and len(result) < config.max_objects
-            and attempts < max_attempts
+            occupied_area
+            < target_area
+            and len(obstacles)
+            < config.max_objects
+            and attempts
+            < max_attempts
         ):
             attempts += 1
 
-            make_column = rng.random() < 0.18
+            block = blocks[
+                int(
+                    rng.integers(
+                        0,
+                        len(blocks),
+                    )
+                )
+            ]
 
-            if make_column:
-                diameter = _uniform_size(rng, min(sx, sy), 0.025, 0.07, 0.25, 1.5)
-                width = depth = diameter
-                height = float(rng.uniform(max(0.8, sz * 0.15), max(0.81, sz * 0.75)))
-                geometry = "cylinder"
-                kind = "column"
-                color = (0.62, 0.62, 0.62, 1.0)
-            else:
-                width = _uniform_size(rng, sx, 0.06, 0.20, 0.5, 7.0)
-                depth = _uniform_size(rng, sy, 0.08, 0.25, 0.4, 7.0)
-                height = float(rng.uniform(max(0.8, sz * 0.20), max(0.81, sz * 0.90)))
-                geometry = "box"
-                kind = "building"
-                color = (0.45, 0.48, 0.52, 1.0)
-
-            if width >= sx or depth >= sy:
-                continue
-
-            x = float(rng.uniform(width / 2.0, sx - width / 2.0))
-            y = float(rng.uniform(depth / 2.0, sy - depth / 2.0))
-            z = height / 2.0
-
-            obstacle = Obstacle(
-                kind=kind,
-                geometry=geometry,
-                position=np.asarray([x, y, z], dtype=float),
-                dimensions=np.asarray([width, depth, height], dtype=float),
-                color=color,
+            obstacle = (
+                self._create_object_in_block(
+                    block=block,
+                    config=config,
+                    rng=rng,
+                )
             )
 
-            if _contains_point_xy(obstacle, config.start, 0.8):
-                continue
-            if _contains_point_xy(obstacle, config.goal, 0.8):
-                continue
-            if _overlaps_xy(obstacle, result, config.min_clearance):
+            if obstacle is None:
                 continue
 
-            result.append(obstacle)
-            occupied_area += obstacle.footprint_area
+            if _near_start_or_goal(
+                obstacle,
+                config,
+            ):
+                continue
 
-        return result
+            clearance = max(
+                config.min_clearance,
+                config.building_spacing,
+            )
+
+            if _obstacles_overlap_xy(
+                obstacle,
+                obstacles,
+                clearance,
+            ):
+                continue
+
+            obstacles.append(
+                obstacle
+            )
+
+            occupied_area += (
+                obstacle.footprint_area
+            )
+
+        return obstacles
+
+    def _generate_blocks(
+        self,
+        config: ArenaConfig,
+    ) -> List[Block]:
+        """
+        Создать прямоугольные городские кварталы.
+
+        Между соседними кварталами остаётся
+        пустое пространство road_width.
+        """
+
+        size_x, size_y, _ = (
+            config.size
+        )
+
+        block_size = float(
+            config.city_block_size
+        )
+
+        road_width = float(
+            config.road_width
+        )
+
+        blocks: List[
+            Block
+        ] = []
+
+        x0 = 0.0
+
+        while x0 < size_x:
+
+            x1 = min(
+                x0 + block_size,
+                size_x,
+            )
+
+            y0 = 0.0
+
+            while y0 < size_y:
+
+                y1 = min(
+                    y0 + block_size,
+                    size_y,
+                )
+
+                width = (
+                    x1 - x0
+                )
+
+                depth = (
+                    y1 - y0
+                )
+
+                if (
+                    width > 0.5
+                    and depth > 0.5
+                ):
+                    blocks.append(
+                        (
+                            x0,
+                            x1,
+                            y0,
+                            y1,
+                        )
+                    )
+
+                y0 += (
+                    block_size
+                    + road_width
+                )
+
+            x0 += (
+                block_size
+                + road_width
+            )
+
+        return blocks
+
+    def _create_object_in_block(
+        self,
+        block: Block,
+        config: ArenaConfig,
+        rng: np.random.Generator,
+    ) -> Obstacle | None:
+
+        (
+            block_x0,
+            block_x1,
+            block_y0,
+            block_y1,
+        ) = block
+
+        block_width = (
+            block_x1
+            - block_x0
+        )
+
+        block_depth = (
+            block_y1
+            - block_y0
+        )
+
+        create_column = (
+            rng.random()
+            < config.column_probability
+        )
+
+        if create_column:
+
+            diameter = float(
+                rng.uniform(
+                    *config.column_diameter_range
+                )
+            )
+
+            if (
+                diameter
+                >= block_width
+                or diameter
+                >= block_depth
+            ):
+                return None
+
+            (
+                min_height,
+                max_height,
+            ) = _clamp_height_range(
+                config.column_height_range,
+                config.size[2],
+            )
+
+            height = float(
+                rng.uniform(
+                    min_height,
+                    max_height,
+                )
+            )
+
+            x = float(
+                rng.uniform(
+                    block_x0
+                    + diameter / 2.0,
+
+                    block_x1
+                    - diameter / 2.0,
+                )
+            )
+
+            y = float(
+                rng.uniform(
+                    block_y0
+                    + diameter / 2.0,
+
+                    block_y1
+                    - diameter / 2.0,
+                )
+            )
+
+            return Obstacle(
+                kind="column",
+
+                geometry="cylinder",
+
+                position=np.asarray(
+                    [
+                        x,
+                        y,
+                        height / 2.0,
+                    ],
+                    dtype=float,
+                ),
+
+                dimensions=np.asarray(
+                    [
+                        diameter,
+                        diameter,
+                        height,
+                    ],
+                    dtype=float,
+                ),
+
+                color=(
+                    0.55,
+                    0.55,
+                    0.58,
+                    1.0,
+                ),
+            )
+
+        width = float(
+            rng.uniform(
+                *config.building_width_range
+            )
+        )
+
+        depth = float(
+            rng.uniform(
+                *config.building_depth_range
+            )
+        )
+
+        if (
+            width
+            >= block_width
+            or depth
+            >= block_depth
+        ):
+            return None
+
+        (
+            min_height,
+            max_height,
+        ) = _clamp_height_range(
+            config.building_height_range,
+            config.size[2],
+        )
+
+        height = float(
+            rng.uniform(
+                min_height,
+                max_height,
+            )
+        )
+
+        x = float(
+            rng.uniform(
+                block_x0
+                + width / 2.0,
+
+                block_x1
+                - width / 2.0,
+            )
+        )
+
+        y = float(
+            rng.uniform(
+                block_y0
+                + depth / 2.0,
+
+                block_y1
+                - depth / 2.0,
+            )
+        )
+
+        #
+        # Небольшая вариативность цвета,
+        # пока модели остаются примитивами.
+        #
+        shade = float(
+            rng.uniform(
+                0.38,
+                0.62,
+            )
+        )
+
+        return Obstacle(
+            kind="building",
+
+            geometry="box",
+
+            position=np.asarray(
+                [
+                    x,
+                    y,
+                    height / 2.0,
+                ],
+                dtype=float,
+            ),
+
+            dimensions=np.asarray(
+                [
+                    width,
+                    depth,
+                    height,
+                ],
+                dtype=float,
+            ),
+
+            color=(
+                shade,
+                shade,
+                min(
+                    1.0,
+                    shade + 0.04,
+                ),
+                1.0,
+            ),
+        )
 
 
-class ForestScenario(ScenarioGenerator):
-    """Лес: вертикальные цилиндрические стволы разной высоты/толщины."""
+class ForestScenario:
+    """
+    Лесной сценарий.
 
-    def generate(self, config: ArenaConfig, rng: np.random.Generator) -> List[Obstacle]:
-        sx, sy, sz = config.size
-        target_area = sx * sy * config.density
+    Деревья могут располагаться:
+    - равномерно;
+    - группами вокруг cluster centers.
+
+    Дополнительно создаются пустые поляны.
+    """
+
+    def generate(
+        self,
+        config: ArenaConfig,
+        rng: np.random.Generator,
+    ) -> List[Obstacle]:
+
+        size_x, size_y, size_z = (
+            config.size
+        )
+
+        target_area = (
+            size_x
+            * size_y
+            * config.density
+        )
+
+        cluster_centers = (
+            self._generate_cluster_centers(
+                config,
+                rng,
+            )
+        )
+
+        clearings = (
+            self._generate_clearings(
+                config,
+                rng,
+            )
+        )
+
+        obstacles: List[
+            Obstacle
+        ] = []
+
         occupied_area = 0.0
-        result: List[Obstacle] = []
 
         attempts = 0
-        max_attempts = max(3000, config.max_objects * 100)
+
+        max_attempts = max(
+            2000,
+            config.max_objects * 100,
+        )
 
         while (
-            occupied_area < target_area
-            and len(result) < config.max_objects
-            and attempts < max_attempts
+            occupied_area
+            < target_area
+            and len(obstacles)
+            < config.max_objects
+            and attempts
+            < max_attempts
         ):
             attempts += 1
 
-            diameter = _uniform_size(rng, min(sx, sy), 0.012, 0.045, 0.18, 1.0)
-            height = float(rng.uniform(max(1.0, sz * 0.25), max(1.01, sz * 0.90)))
+            position_xy = (
+                self._sample_tree_position(
+                    config=config,
+                    rng=rng,
+                    cluster_centers=(
+                        cluster_centers
+                    ),
+                )
+            )
 
-            if diameter >= sx or diameter >= sy:
+            if position_xy is None:
                 continue
 
-            x = float(rng.uniform(diameter / 2.0, sx - diameter / 2.0))
-            y = float(rng.uniform(diameter / 2.0, sy - diameter / 2.0))
-            z = height / 2.0
+            x, y = position_xy
+
+            if self._inside_clearing(
+                x,
+                y,
+                clearings,
+            ):
+                continue
+
+            diameter = float(
+                rng.uniform(
+                    *config.tree_diameter_range
+                )
+            )
+
+            (
+                min_height,
+                max_height,
+            ) = _clamp_height_range(
+                config.tree_height_range,
+                size_z,
+            )
+
+            height = float(
+                rng.uniform(
+                    min_height,
+                    max_height,
+                )
+            )
+
+            radius = (
+                diameter
+                / 2.0
+            )
+
+            if not (
+                radius
+                <= x
+                <= size_x - radius
+
+                and radius
+                <= y
+                <= size_y - radius
+            ):
+                continue
 
             tree = Obstacle(
                 kind="tree",
+
                 geometry="cylinder",
-                position=np.asarray([x, y, z], dtype=float),
-                dimensions=np.asarray([diameter, diameter, height], dtype=float),
-                color=(0.32, 0.20, 0.08, 1.0),
+
+                position=np.asarray(
+                    [
+                        x,
+                        y,
+                        height / 2.0,
+                    ],
+                    dtype=float,
+                ),
+
+                dimensions=np.asarray(
+                    [
+                        diameter,
+                        diameter,
+                        height,
+                    ],
+                    dtype=float,
+                ),
+
+                color=(
+                    0.28,
+                    0.18,
+                    0.07,
+                    1.0,
+                ),
             )
 
-            if _contains_point_xy(tree, config.start, 0.6):
+            if _near_start_or_goal(
+                tree,
+                config,
+            ):
                 continue
-            if _contains_point_xy(tree, config.goal, 0.6):
+
+            if _obstacles_overlap_xy(
+                tree,
+                obstacles,
+                config.min_clearance,
+            ):
                 continue
-            if _overlaps_xy(tree, result, config.min_clearance * 0.45):
-                continue
 
-            result.append(tree)
-            occupied_area += tree.footprint_area
+            obstacles.append(
+                tree
+            )
 
-        return result
+            occupied_area += (
+                tree.footprint_area
+            )
+
+        return obstacles
+
+    def _generate_cluster_centers(
+        self,
+        config: ArenaConfig,
+        rng: np.random.Generator,
+    ):
+
+        centers = []
+
+        size_x, size_y, _ = (
+            config.size
+        )
+
+        for _ in range(
+            config.forest_cluster_count
+        ):
+
+            centers.append(
+                np.asarray(
+                    [
+                        rng.uniform(
+                            0.0,
+                            size_x,
+                        ),
+
+                        rng.uniform(
+                            0.0,
+                            size_y,
+                        ),
+                    ],
+                    dtype=float,
+                )
+            )
+
+        return centers
+
+    def _generate_clearings(
+        self,
+        config: ArenaConfig,
+        rng: np.random.Generator,
+    ):
+
+        clearings = []
+
+        size_x, size_y, _ = (
+            config.size
+        )
+
+        for _ in range(
+            config.forest_clearing_count
+        ):
+
+            clearings.append(
+                (
+                    float(
+                        rng.uniform(
+                            0.0,
+                            size_x,
+                        )
+                    ),
+
+                    float(
+                        rng.uniform(
+                            0.0,
+                            size_y,
+                        )
+                    ),
+
+                    float(
+                        config.forest_clearing_radius
+                    ),
+                )
+            )
+
+        return clearings
+
+    def _sample_tree_position(
+        self,
+        config: ArenaConfig,
+        rng: np.random.Generator,
+        cluster_centers,
+    ):
+        """
+        Часть деревьев располагается
+        около cluster center.
+
+        Остальные распределяются
+        равномерно по лесу.
+        """
+
+        size_x, size_y, _ = (
+            config.size
+        )
+
+        use_cluster = (
+            bool(cluster_centers)
+            and rng.random()
+            < config.forest_cluster_probability
+        )
+
+        if not use_cluster:
+
+            return (
+                float(
+                    rng.uniform(
+                        0.0,
+                        size_x,
+                    )
+                ),
+
+                float(
+                    rng.uniform(
+                        0.0,
+                        size_y,
+                    )
+                ),
+            )
+
+        center = cluster_centers[
+            int(
+                rng.integers(
+                    0,
+                    len(cluster_centers),
+                )
+            )
+        ]
+
+        #
+        # Normal distribution даёт более
+        # естественное сгущение около центра.
+        #
+        x = float(
+            rng.normal(
+                center[0],
+                config.forest_cluster_radius,
+            )
+        )
+
+        y = float(
+            rng.normal(
+                center[1],
+                config.forest_cluster_radius,
+            )
+        )
+
+        return (
+            x,
+            y,
+        )
+
+    @staticmethod
+    def _inside_clearing(
+        x: float,
+        y: float,
+        clearings,
+    ) -> bool:
+
+        for (
+            clearing_x,
+            clearing_y,
+            radius,
+        ) in clearings:
+
+            dx = (
+                x
+                - clearing_x
+            )
+
+            dy = (
+                y
+                - clearing_y
+            )
+
+            if (
+                dx * dx
+                + dy * dy
+                <= radius * radius
+            ):
+                return True
+
+        return False
 
 
-def make_scenario(name: str) -> ScenarioGenerator:
+def make_scenario(
+    name: str,
+):
+    """
+    Factory сценариев.
+    """
+
     if name == "empty":
         return EmptyScenario()
+
     if name == "city":
         return CityScenario()
+
     if name == "forest":
         return ForestScenario()
-    raise ValueError(f"Неизвестный scenario: {name}")
+
+    raise ValueError(
+        f"Неизвестный scenario: {name}"
+    )
